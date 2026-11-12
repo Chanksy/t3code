@@ -64,6 +64,9 @@ import {
   decodeCommitFilesJson,
   pullRequestChecksFromContexts,
   decodeWorkflowRunsJson,
+  decodeCheckRunsJson,
+  decodeCommitStatusesJson,
+  type GitHubCheckContext,
   type GitHubPullRequestCore,
   type GitHubPullRequestFileStat,
   type GitHubPullRequestWatchFingerprint,
@@ -1426,6 +1429,53 @@ export const make = Effect.gen(function* () {
     return { contexts, truncated: first.nextCursor === null || after !== null };
   });
 
+  const readHeadChecks = Effect.fn("GitHubPullRequestApi.readHeadChecks")(function* (
+    input: { readonly cwd: string; readonly host: string; readonly repository: string },
+    headSha: string | null | undefined,
+  ) {
+    if (typeof headSha !== "string" || !isCommitSha(headSha))
+      return yield* readError(
+        input.cwd,
+        "readHeadChecks",
+        new Error("Missing pull request head commit."),
+      );
+    const { owner, name } = parseRepositorySelector(input.repository);
+    const contexts: GitHubCheckContext[] = [];
+    for (const kind of ["check-runs", "status"] as const) {
+      for (let page = 1; page <= CHECK_CONTEXT_PAGES; page++) {
+        const response = yield* api.rest({
+          host: input.host,
+          operation: "readHeadChecks",
+          path: `repos/${owner}/${name}/commits/${headSha}/${kind}?${kind === "check-runs" ? "filter=latest&" : ""}per_page=100&page=${page}`,
+        });
+        if (response.truncated || response.invalidUtf8)
+          return yield* readError(
+            input.cwd,
+            "readHeadChecks",
+            new Error("Incomplete commit checks response."),
+          );
+        const result = yield* decodeWith(
+          input.cwd,
+          "readHeadChecks",
+          (raw) =>
+            kind === "check-runs"
+              ? decodeCheckRunsJson(raw, headSha)
+              : decodeCommitStatusesJson(raw, headSha),
+          response.body,
+        );
+        contexts.push(...result.contexts);
+        if (result.rawCount < 100) break;
+        if (page === CHECK_CONTEXT_PAGES)
+          return yield* readError(
+            input.cwd,
+            "readHeadChecks",
+            new Error("Commit checks exceeded the pagination limit."),
+          );
+      }
+    }
+    return { ...pullRequestChecksFromContexts(contexts), checksTruncated: false };
+  });
+
   // GitHub refuses a requested-reviewer list holding a team the viewer cannot see. Remember the
   // refusal so later reads of that pull request skip straight to the read without reviewers.
   const refusedReviewers = yield* Cache.make({
@@ -1482,6 +1532,19 @@ export const make = Effect.gen(function* () {
                       ...pullRequestChecksFromContexts(all.contexts),
                       checksTruncated: all.truncated,
                     })),
+                  ),
+              ),
+              Effect.filterOrElse(
+                (core) =>
+                  core.state !== "open" ||
+                  core.checks.length > 0 ||
+                  core.checksState !== null ||
+                  core.checksTruncated ||
+                  typeof core.headSha !== "string" ||
+                  !isCommitSha(core.headSha),
+                (core) =>
+                  readHeadChecks(input, core.headSha).pipe(
+                    Effect.map((checks) => ({ ...core, ...checks })),
                   ),
               ),
             ),
@@ -1745,9 +1808,23 @@ export const make = Effect.gen(function* () {
       const lookup = pullRequestLookup(input);
       if (lookup === null) return Effect.succeed(null);
       return GraphQLResolver.request(lookup, watchFingerprintResolver).pipe(
-        Effect.map((result) => {
-          const pullRequest = result.repository?.pullRequest;
-          return pullRequest == null ? null : toPullRequestWatchFingerprint(pullRequest);
+        Effect.flatMap((result) => {
+          const pr = result.repository?.pullRequest;
+          if (pr == null) return Effect.succeed(null);
+          const fingerprint = toPullRequestWatchFingerprint(pr);
+          const counts = pr.commits.nodes?.[0]?.commit.statusCheckRollup?.contexts;
+          const hasChecks = [
+            ...(counts?.checkRunCountsByState ?? []),
+            ...(counts?.statusContextCountsByState ?? []),
+          ].some((count) => count.count > 0);
+          if (pr.state !== "OPEN" || hasChecks || !isCommitSha(pr.headRefOid))
+            return Effect.succeed(fingerprint);
+          return readHeadChecks(input, pr.headRefOid).pipe(
+            Effect.map((checks) => ({
+              ...fingerprint,
+              status: `${fingerprint.status} ${JSON.stringify({ ...checks, checks: checks.checks.toSorted((a, b) => a.name.localeCompare(b.name)) })}`,
+            })),
+          );
         }),
         Effect.catchIf(isNotFoundOnly, () => Effect.succeed(null)),
         (effect) => batchedRead({ ...input, operation: "getPullRequestWatchFingerprint" }, effect),

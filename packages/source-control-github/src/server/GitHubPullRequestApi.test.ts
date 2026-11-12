@@ -3562,6 +3562,151 @@ layer("GitHubPullRequestApi.layer", (it) => {
     }),
   );
 
+  it.effect("reads the exact head's check runs when the rollup is empty", () =>
+    Effect.gen(function* () {
+      const stale = "a".repeat(40);
+      const head = "b".repeat(40);
+      const unreadable = "c".repeat(40);
+      let headRefOid = stale;
+      let statuses: ReadonlyArray<{ context: string; state: string }> = [];
+      const runs = new Map<string, ReadonlyArray<readonly [string, string, string | null]>>([
+        [
+          stale,
+          [
+            ["check", "completed", "success"],
+            ["unit", "completed", "success"],
+          ],
+        ],
+      ]);
+      mockedExecute.mockImplementation((call) => {
+        if (call.kind === "graphql") {
+          const rollup = { nodes: [{ commit: { statusCheckRollup: null } }] };
+          const response = coreResponse({
+            headRefOid,
+            commits: rollup,
+            comments: { totalCount: 0, nodes: [] },
+            reviews: { totalCount: 0, nodes: [] },
+            reviewThreads: { totalCount: 0 },
+          });
+          return Effect.succeed(
+            output(
+              encodeJson(
+                call.query.includes("_0_repository")
+                  ? { data: { _0_repository: response.data.repository } }
+                  : response,
+              ),
+            ),
+          );
+        }
+        const sha = /commits\/([a-f0-9]{40})\/check-runs\?/.exec(call.path)?.[1] ?? "";
+        if (sha === unreadable) return Effect.succeed(output("{}", false, false, {}, 403));
+        if (call.path.includes("/status?"))
+          return Effect.succeed(output(encodeJson({ sha: headRefOid, statuses })));
+        const page = Number(new URLSearchParams(call.path.split("?")[1]).get("page"));
+        const check_runs = (runs.get(sha) ?? [])
+          .slice((page - 1) * 100, page * 100)
+          .map(([name, status, conclusion]) => ({
+            head_sha: sha,
+            name,
+            status,
+            conclusion,
+            details_url: `https://github.com/acme/web/actions/runs/1/job/${name}`,
+            started_at: "2026-11-12T01:30:00Z",
+            completed_at: status === "completed" ? "2026-11-12T01:34:36Z" : null,
+          }));
+        return Effect.succeed(
+          output(
+            encodeJson({
+              total_count: check_runs.length,
+              check_runs: [
+                ...check_runs,
+                {
+                  head_sha: stale,
+                  name: "stale failure",
+                  status: "completed",
+                  conclusion: "failure",
+                },
+              ].filter((run) => sha !== stale || run.name !== "stale failure"),
+            }),
+          ),
+        );
+      });
+      const cli = yield* GitHubPullRequestApi.GitHubPullRequestApi;
+      const read = () =>
+        cli
+          .getPullRequestDetail(pullRequestInput)
+          .pipe(
+            Effect.map((detail) => [
+              detail.headSha,
+              detail.checksState,
+              detail.checks.map((check) => `${check.name}:${check.status}`).sort(),
+            ]),
+          );
+
+      expect(yield* read()).toEqual([stale, "passing", ["check:success", "unit:success"]]);
+      headRefOid = head;
+      runs.set(head, [
+        ["check", "in_progress", null],
+        ["unit", "queued", null],
+      ]);
+      expect(yield* read()).toEqual([head, "pending", ["check:pending", "unit:pending"]]);
+      const fingerprint = () =>
+        Effect.gen(function* () {
+          const fiber = yield* cli
+            .getPullRequestWatchFingerprint(pullRequestInput)
+            .pipe(Effect.forkChild);
+          yield* TestClock.adjust("10 millis");
+          return yield* Fiber.join(fiber);
+        });
+      const pendingFingerprint = yield* fingerprint();
+      runs.set(head, [
+        ["check", "completed", "success"],
+        ["unit", "completed", "success"],
+      ]);
+      expect(yield* read()).toEqual([head, "passing", ["check:success", "unit:success"]]);
+      const passingFingerprint = yield* fingerprint();
+      expect(passingFingerprint?.status).not.toBe(pendingFingerprint?.status);
+      expect(yield* fingerprint()).toEqual(passingFingerprint);
+      runs.set(head, [
+        ["check", "completed", "success"],
+        ["unit", "completed", "failure"],
+      ]);
+      expect(yield* read()).toEqual([head, "failing", ["check:success", "unit:failure"]]);
+      expect((yield* fingerprint())?.status).not.toBe(passingFingerprint?.status);
+      const paths = mockedExecute.mock.calls.flatMap(([call]) =>
+        call.kind === "rest" ? [call.path] : [],
+      );
+      expect(
+        paths.every(
+          (path) => path.includes(`/commits/${stale}/`) || path.includes(`/commits/${head}/`),
+        ),
+      ).toBe(true);
+      runs.set(
+        head,
+        Array.from(
+          { length: 101 },
+          (_, i) => [`job${i}`, "completed", i === 100 ? "failure" : "success"] as const,
+        ),
+      );
+      const paged = yield* cli.getPullRequestDetail(pullRequestInput);
+      expect(paged.checks).toHaveLength(101);
+      expect(paged.checksState).toBe("failing");
+
+      runs.set(head, []);
+      statuses = [{ context: "external-ci", state: "pending" }];
+      expect(yield* read()).toEqual([head, "pending", ["external-ci:pending"]]);
+      statuses = [{ context: "external-ci", state: "failure" }];
+      expect(yield* read()).toEqual([head, "failing", ["external-ci:failure"]]);
+      runs.set(
+        head,
+        Array.from({ length: 1000 }, (_, i) => [`job${i}`, "completed", "success"] as const),
+      );
+      expect(Result.isFailure(yield* Effect.result(read()))).toBe(true);
+      headRefOid = unreadable;
+      expect(Result.isFailure(yield* Effect.result(read()))).toBe(true);
+    }),
+  );
+
   it.effect.each([false, true])(
     "continues after the core check page without reading it twice (reviewer refusal: %s)",
     (refused) =>

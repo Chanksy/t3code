@@ -218,6 +218,35 @@ const RawWorkflowRunsSchema = Schema.Struct({
   ),
 });
 
+const NullableString = Schema.optional(Schema.NullOr(Schema.String));
+const RawCheckRunsSchema = Schema.Struct({
+  check_runs: Schema.Array(
+    Schema.Struct({
+      head_sha: Schema.String,
+      name: NullableString,
+      status: NullableString,
+      conclusion: NullableString,
+      details_url: NullableString,
+      html_url: NullableString,
+      started_at: NullableString,
+      completed_at: NullableString,
+    }),
+  ),
+});
+
+const RawCommitStatusesSchema = Schema.Struct({
+  sha: Schema.String,
+  statuses: Schema.Array(
+    Schema.Struct({
+      context: Schema.String,
+      state: Schema.String,
+      description: NullableString,
+      target_url: NullableString,
+    }),
+  ),
+});
+const decodeCommitStatuses = decodeJsonResult(RawCommitStatusesSchema);
+
 const RawPullRequestFileSchema = Schema.Struct({
   filename: Schema.String,
   status: Schema.optional(Schema.NullOr(Schema.String)),
@@ -788,6 +817,7 @@ function toDetail(raw: DetailFields): GitHubPullRequestDetail {
 
 const decodeUnknownList = decodeJsonResult(Schema.Array(Schema.Unknown));
 const decodeWorkflowRuns = decodeJsonResult(RawWorkflowRunsSchema);
+const decodeCheckRuns = decodeJsonResult(RawCheckRunsSchema);
 const decodeFileEntry = Schema.decodeUnknownExit(RawPullRequestFileSchema);
 const decodeRow = Schema.decodeUnknownExit(PullRequestRow);
 
@@ -1104,6 +1134,56 @@ export function decodeWorkflowRunsJson(
       url: trimmed(run.html_url),
     })),
     rawCount: decoded.success.workflow_runs.length,
+  });
+}
+
+/** One REST page of checks belonging to a single commit. */
+export interface GitHubCheckRunPage {
+  readonly contexts: ReadonlyArray<GitHubCheckContext>;
+  readonly rawCount: number;
+}
+
+/** REST check runs carry no workflow name or required flag, so they dedupe by name alone. */
+export function decodeCheckRunsJson(
+  raw: string,
+  headSha: string,
+): Result.Result<GitHubCheckRunPage, DecodeFailure> {
+  const decoded = decodeCheckRuns(raw);
+  if (!Result.isSuccess(decoded)) return Result.fail(decoded.failure);
+  return Result.succeed({
+    contexts: decoded.success.check_runs
+      .filter((run) => run.head_sha === headSha)
+      .map((run) => ({
+        name: run.name,
+        status: run.status,
+        conclusion: run.conclusion,
+        detailsUrl: run.details_url ?? run.html_url,
+        startedAt: run.started_at,
+        completedAt: run.completed_at,
+        workflowName: null,
+      })),
+    rawCount: decoded.success.check_runs.length,
+  });
+}
+
+/** Decode the latest status for each context on the requested commit. */
+export function decodeCommitStatusesJson(
+  raw: string,
+  headSha: string,
+): Result.Result<GitHubCheckRunPage, DecodeFailure> {
+  const decoded = decodeCommitStatuses(raw);
+  if (!Result.isSuccess(decoded)) return Result.fail(decoded.failure);
+  return Result.succeed({
+    contexts:
+      decoded.success.sha === headSha
+        ? decoded.success.statuses.map((status) => ({
+            context: status.context,
+            state: status.state,
+            description: status.description,
+            targetUrl: status.target_url,
+          }))
+        : [],
+    rawCount: decoded.success.statuses.length,
   });
 }
 
