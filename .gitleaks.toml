@@ -1,0 +1,6 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Upstream localhost TLS test fixture"
+paths = ['''^apps/server/src/peer/fixtures/localhost-key\.pem$''']
